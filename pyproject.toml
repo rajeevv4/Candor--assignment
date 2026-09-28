@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "candor-memory"
+version = "1.0.0"
+description = "Temporal Workplace Memory & Action System for Candor"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Candor Candidate" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+candor = "candor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

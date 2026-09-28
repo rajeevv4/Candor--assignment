@@ -1,0 +1,25 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Environment variables
+.env
+.env.local
+
+# IDE and OS
+.DS_Store
+.vscode/
+.idea/
+
+# Output artifacts
+results_*.json
+tmp_*.jsonl
+test_answers.jsonl
