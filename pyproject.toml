@@ -9,7 +9,7 @@ description = "Temporal Workplace Memory & Action System for Candor"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
-    { name = "Candor Candidate" }
+    { name = "Rajeev Karakoti", email = "rajeevkarakoti04@gmail.com" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
