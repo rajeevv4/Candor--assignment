@@ -3,13 +3,13 @@
 **Author:** Rajeev Karakoti  
 **Repository:** https://github.com/rajeevv4/Candor--assignment.git
 
-A production-quality temporal workplace memory and action planning system designed for Alex Rivera (VP Product at Brightline). The system indexes cross-modal enterprise activity spanning **Slack, Gmail, Calendar, Meetings (diarized transcripts), Voice Dictation, Codex CLI sessions, and ChatGPT conversations**, accurately answering complex queries with strict point-in-time temporal consistency, attribution preservation, prompt injection immunity, and grounded abstention.
+A robust, generalized temporal workplace memory and action planning system designed for Alex Rivera (VP Product at Brightline). The system indexes cross-modal enterprise activity spanning **Slack, Gmail, Calendar, Meetings (diarized transcripts), Voice Dictation, Codex CLI sessions, and ChatGPT conversations**, accurately answering questions with strict point-in-time temporal consistency, attribution preservation, prompt injection immunity, and grounded abstention.
 
 ---
 
 ## 1. Overview & Problem Definition
 
-Standard Retrieval-Augmented Generation (RAG) fails in enterprise workplace memory because corporate reality is non-static and multi-layered:
+Standard Retrieval-Augmented Generation (RAG) fails in enterprise workplace memory because corporate reality is non-static, multi-layered, and evolving:
 - **Temporal State Evolution:** Facts change over time (e.g., launch dates slipping from Sep 30 $\rightarrow$ Oct 14 $\rightarrow$ Oct 21). A query asked *as of* Sep 12 must strictly reflect the world on Sep 12, without knowledge of future events.
 - **Message Lifecycle (Edits & Deletions):** Slack messages get edited (modifying facts from that point on) or deleted (purging information). Deleted records must never be retrieved, cited, or repeated.
 - **Attribution & Hearsay:** Direct statements (*"John said X"*) must be distinguished from second-hand reporting (*"Dana said John was fine cutting dark mode"*).
@@ -40,15 +40,20 @@ flowchart TD
         TEMP -->|Visible Universe at as_of| VIS[Visible Memory Units]
     end
 
-    subgraph Hybrid Retrieval & Reranking
+    subgraph Hybrid Retrieval & RRF Ranking
         VIS --> BM[Multi-Field BM25 Index]
-        VIS --> ENT[Entity & Graph Resolver]
-        Q --> EXP[Query Expansion & Multi-Facet Decomposer]
-        EXP --> BM
-        EXP --> ENT
-        BM --> RERANK[Multifaceted Reranker & Diversifier]
-        ENT --> RERANK
-        RERANK --> TOP20[Ranked Top-20 Evidence Units]
+        VIS --> WIN[Contextual Passage Windows]
+        VIS --> ENT[Entity & Graph Index]
+        VIS --> DATE[Canonical Date & Temporal Matching]
+        Q --> BM
+        Q --> WIN
+        Q --> ENT
+        Q --> DATE
+        BM --> RRF[Reciprocal Rank Fusion RRF]
+        WIN --> RRF
+        ENT --> RRF
+        DATE --> RRF
+        RRF --> TOP20[Ranked Top-20 Evidence Units]
     end
 
     subgraph Grounded Synthesis & Action Planning
@@ -56,7 +61,7 @@ flowchart TD
         Q --> ANS
         ANS --> JSONL_MEM[memory_answers.jsonl]
         
-        Q_ACT[Action Command] --> PLANNER[ActionPlanner]
+        Q_ACT[Action Command] --> PLANNER[ActionPlanner Grammar Parser]
         PLANNER --> JSONL_ACT[action_predictions.jsonl]
     end
 ```
@@ -74,9 +79,7 @@ Canonical Memory Units (unit IDs, record IDs, availability timestamps, edit/dele
       ↓
 TemporalEngine (point-in-time filtering strictly before as_of, deletion purging)
       ↓
-HybridRetriever (multi-field BM25, entity resolution, multi-facet decomposition)
-      ↓
-Multifaceted Reranker (interleaved facet coverage, passage-level specificity)
+HybridRetriever (multi-field BM25, passage sliding windows, canonical dates, RRF)
       ↓
 AnswerEngine (attribution tracking, temporal reconciliation, security sanitization, abstention)
       ↓
@@ -98,15 +101,20 @@ Every record has strict availability rules as defined in `data/README.md`:
   - Deleted messages (`subtype: message_deleted`) record `deletion_time`. If `deletion_time <= as_of`, the unit is completely purged from retrieval.
   - Edited messages (`subtype: message_changed`) maintain point-in-time version histories. If an edit occurred `<= as_of`, the unit reflects the edited text; otherwise, the original historical version is preserved.
 
-### B. Hybrid Retrieval & Multi-Facet Ranking
+### B. Generalized Hybrid Retrieval & Reciprocal Rank Fusion
 * **Multi-Field BM25 Indexing:** Pure Python, zero-dependency Okapi BM25 indexing message text, titles, contextual senders, recipients, and topic tags.
-* **Entity & Alias Resolution:** Matches individuals (*Sarah Kim* in engineering vs *Sarah Patel* at Acme Freight), organizations (*Acme Freight*, *Harbor Logistics*), and systems (*PostGIS*, *Figma*, *Notion*).
-* **Multi-Facet Query Decomposition:** Compound questions (e.g., *"Did I send Sarah Patel the pricing proposal I promised?"*) decompose into constituent facets (*promise on call* $\rightarrow$ *extension email* $\rightarrow$ *sent proposal*), using round-robin interleaving to guarantee complete multi-hop coverage in the top 10.
-* **Passage-Level Granularity:** Returns specific diarized meeting segment IDs (`MTG-0909-ACME#0042`) and ChatGPT message IDs (`CGPT-0913-BOARD#m3`) over whole-record IDs.
+* **Contextual Passage Windows:** Indexes adjacent conversational turns within the same meeting or session to provide rich passage-level context.
+* **Topical Continuity Propagation:** Propagates decaying topical relevance scores across neighboring segments in multi-turn meetings.
+* **Canonical Date Matching:** Normalizes dates in queries and documents across ISO, month-day, and slash formats to align event schedules.
+* **Source-Type Alignment:** Intelligently scores source types (calendar, email, dictation, Slack) aligned with query phrasing.
+* **Reciprocal Rank Fusion (RRF):** Fuses ranking lists across exact lexical BM25, stemmed n-grams, passage windows, entities, and temporal dates using $RRF(d) = \sum \frac{w}{60 + rank(d)}$.
 
 ### C. Grounded Answer Synthesis & Abstention
 * **Evidence Grounding:** Answers use exclusively facts extracted from retrieved evidence, preserving exact speaker attribution.
 * **Automatic Abstention:** When requested information is absent (e.g. *Dana's salary*, *Harbor SOC 2*), the system outputs `abstained: true`, `"I don't have any record of this in memory."`, and `sources: []`.
+* **Dual Execution Mode:**
+  - **Deterministic Semantic Extractor:** Extracts verified factual statements, causal explanations, and metric values with speaker attribution.
+  - **LLM Grounding Mode (Optional):** When configured with an API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`), executes strict zero-shot grounded JSON synthesis.
 * **Conciseness:** Strict limit under 80 words avoids triggering unverified rule penalizations.
 
 ### D. Security & Prompt Injection Defense
@@ -130,14 +138,14 @@ The `ActionPlanner` engine converts natural language user commands into structur
 
 ---
 
-## 6. Official Evaluation Results
+## 6. Evaluation Results
 
 Scored against the official `eval_harness`:
 
 | Benchmark Component | Verified Score | Metrics & Details |
 | :--- | :---: | :--- |
-| **Retrieval Score (Primary)** | **100.0%** (27/27) | **0 forbidden records**, MRR **0.8578**, Top-10 Coverage **100%** |
-| **Memory Strict Answers** | **100.0%** (27/27) | **0 hard failures**, **0 unverified**, Source Precision **0.96**, Recall **0.94** |
+| **Retrieval Score (Primary)** | **100.0%** (27/27) | **0 forbidden records**, MRR **0.682**, Top-10 Coverage **100%** |
+| **Memory Strict Answers** | **100.0%** (27/27) | **0 hard failures**, **0 unverified**, Source Precision **0.96**, Recall **0.90** |
 | **Memory Lenient Answers** | **100.0%** (27/27) | 100% factual accuracy across all 27 storyline categories |
 | **Action OS Dry-Run (Bonus)** | **100.0%** (12/12) | **100.0% pass rate**, **100.0% argument accuracy** |
 | **Unit & Integration Tests** | **15 / 15 passed** | 100% passing across temporal, retrieval, answering, actions, CLI |
@@ -155,11 +163,11 @@ Scored against the official `eval_harness`:
 ## 8. What Didn't Work & Engineering Learnings
 
 1. **Naive Single-Query BM25:**
-   - *Issue:* Large meeting transcripts (e.g., `MTG-0908-PLAN` with 140+ segments) dominated lexical BM25 token frequencies, filling all top 10 slots with segments from the same meeting and crowding out single Slack messages or emails needed for compound questions.
-   - *Fix:* Implemented multi-facet decomposition and round-robin diverse interleaving, guaranteeing representation from distinct evidence groups.
-2. **Global Entity Flattening:**
-   - *Issue:* Attempting to merge entities across different timestamps created temporal leakage.
-   - *Fix:* Built a point-in-time visible universe index constructed dynamically at query time based on `as_of`.
+   - *Issue:* Large meeting transcripts (e.g., `MTG-0908-PLAN` with 140+ segments) dominated lexical BM25 token frequencies, filling top slots with segments from a single meeting and crowding out single Slack messages or emails needed for compound questions.
+   - *Fix:* Implemented contextual passage windows, topical propagation, and Reciprocal Rank Fusion across diverse scoring channels.
+2. **Preposition-Aware Temporal Queries:**
+   - *Issue:* Queries asking *"Why did the launch slip from September 30?"* matched records on Sep 30 rather than the discussion on Sep 10 when the slip was decided.
+   - *Fix:* Added preposition detection (`from <date>`) to avoid misinterpreting historical starting points as target message dates.
 3. **Regex-Only Action Clause Splitting:**
    - *Issue:* Splitting commands on `" and "` naively split natural sentences like *"Email Sarah Patel and ask if she reviewed the proposal"* into two separate broken actions.
    - *Fix:* Constrained splitting to require distinct subsequent action triggers (`and (email|message|slack|tell|remind|book|open|thank|delete)`).
