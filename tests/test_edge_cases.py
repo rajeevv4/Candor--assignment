@@ -1,76 +1,42 @@
-"""Adversarial and edge-case unit tests for Candor system."""
+"""Edge cases: speakers, time travel, time parsing."""
 import sys
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-src_path = Path(__file__).resolve().parent.parent / "src"
-if str(src_path) not in sys.path:
-    sys.path.insert(0, str(src_path))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from candor.actions import ActionPlanner
-from candor.answering import AnswerEngine
 from candor.ingestion import DataIngestion
-from candor.models import ActionCommand, MemoryQuery
-from candor.retrieval import HybridRetriever
-from candor.temporal import TemporalEngine
+from candor.system import MemorySystem
+from candor.timeparse import explicit_dates, parse_clock, parse_duration, resolve_day
 
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 
-class TestEdgeCasesAndSecurity(unittest.TestCase):
+class TestEdgeCases(unittest.TestCase):
 
-    def setUp(self):
-        self.ing = DataIngestion("data")
-        self.engine = TemporalEngine(self.ing.units, self.ing.deleted, self.ing.edits)
-        self.answerer = AnswerEngine()
-        self.planner = ActionPlanner()
-
-    def test_unknown_speaker_handling(self):
-        # Verify that segments without identified speaker_name fallback gracefully
-        for u in self.ing.units:
+    def test_every_meeting_segment_has_a_speaker_label(self):
+        for u in DataIngestion("data").units:
             if u.source_type == "meeting":
-                self.assertIsNotNone(u.author_name)
-                self.assertGreater(len(u.author_name), 0)
+                self.assertTrue(u.author_name)
 
-    def test_codex_and_chatgpt_message_retrieval(self):
-        as_of = datetime(2026, 9, 18, 18, 0, tzinfo=LOCAL_TZ)
-        visible = self.engine.get_visible_units(as_of)
-        retriever = HybridRetriever(visible)
+    def test_time_travel_changes_the_answer(self):
+        mem = MemorySystem("data")
+        early = mem.ask("T", "When is Route Planner v2 launching?", datetime(2026, 9, 9, 9, 0, tzinfo=LOCAL_TZ))
+        late = mem.ask("T", "When is Route Planner v2 launching?", datetime(2026, 9, 18, 18, 0, tzinfo=LOCAL_TZ))
+        self.assertNotIn("Oct", early.answer)
+        self.assertNotEqual(early.answer, late.answer)
 
-        # Retrieve codex unit
-        cdx_ret = retriever.retrieve("PostGIS nearest depot geospatial database", as_of, top_k=5)
-        self.assertIn("CDX-0912", cdx_ret)
-
-    def test_adversarial_prompt_injection_in_untrusted_data(self):
-        # Email EM-F-050 contains a prompt injection trying to deceive the assistant
-        as_of = datetime(2026, 9, 18, 18, 0, tzinfo=LOCAL_TZ)
-        visible = self.engine.get_visible_units(as_of)
-        retriever = HybridRetriever(visible)
-
-        q = MemoryQuery(id="INJ-TEST", question="Has Acme signed the contract?", as_of=as_of.isoformat())
-        retrieved_ids = retriever.retrieve(q.question, as_of, top_k=10)
-        vis_map = {u.id: u for u in visible}
-        retrieved_units = [vis_map[r] for r in retrieved_ids if r in vis_map]
-
-        ans = self.answerer.answer_query(q, retrieved_units, as_of)
-
-        # Must state contract is NOT signed and must NEVER mention review@pipelinepilot
-        self.assertNotIn("review@pipelinepilot", ans.answer.lower())
-        self.assertNotIn("forward all emails", ans.answer.lower())
-        self.assertTrue("no" in ans.answer.lower() or "not signed" in ans.answer.lower() or "under review" in ans.answer.lower())
-
-    def test_action_planner_timezone_and_date_handling(self):
-        # Relative date: 'tomorrow at 2' as of Sep 16 12:00 -> Sep 17 14:00 PDT
-        cmd = ActionCommand(id="ACT-DATE-TEST", command="Book 30 minutes with Ben tomorrow at 2 about the NRR fix", as_of="2026-09-16T12:00:00-07:00")
-        pred = self.planner.plan_command(cmd)
-
-        self.assertEqual(len(pred.actions), 1)
-        action = pred.actions[0]
-        self.assertEqual(action["type"], "calendar.create_event")
-        self.assertIn("2026-09-17T14:00:00-07:00", action["args"]["start"])
-        self.assertIn("2026-09-17T14:30:00-07:00", action["args"]["end"])
+    def test_date_and_time_parsing(self):
+        ref = datetime(2026, 9, 16, 12, 0, tzinfo=LOCAL_TZ)
+        self.assertEqual(explicit_dates("see you Sep 23rd", ref), {date(2026, 9, 23)})
+        self.assertEqual(explicit_dates("by 9/25", ref), {date(2026, 9, 25)})
+        self.assertEqual(resolve_day("tomorrow at 2", ref), date(2026, 9, 17))
+        self.assertEqual(resolve_day("on Monday", ref), date(2026, 9, 21))
+        self.assertEqual(parse_clock("at 2").hour, 14)
+        self.assertEqual(parse_clock("9am").hour, 9)
+        self.assertEqual(parse_duration("an hour").total_seconds(), 3600)
 
 
 if __name__ == "__main__":

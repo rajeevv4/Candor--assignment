@@ -1,12 +1,12 @@
 {"id": "ACT-TR-01", "actions": [{"type": "slack.send_message", "args": {"to": "U03SARAHK", "text": "The geocoding fix looks good"}}]}
-{"id": "ACT-TR-02", "actions": [{"type": "gmail.send", "args": {"to": ["sarah.patel@acmefreight.example.com"], "subject": "Follow up on pricing proposal", "body": "Hi Sarah, checking in to see if you have had a chance to look at the pricing proposal."}}]}
-{"id": "ACT-TR-03", "actions": [{"type": "reminder.create", "args": {"text": "follow up with Acme on the 25th", "due": "2026-09-25T09:00:00-07:00"}}]}
+{"id": "ACT-TR-02", "actions": [{"type": "gmail.send", "args": {"to": ["sarah.patel@acmefreight.example.com"], "cc": [], "subject": "Proposal", "body": "Hi Sarah,\n\nHave you had a chance to look at the proposal?\n\nAlex"}}]}
+{"id": "ACT-TR-03", "actions": [{"type": "reminder.create", "args": {"text": "Follow up with Acme", "due": "2026-09-25T09:00:00-07:00"}}]}
 {"id": "ACT-TR-04", "actions": [{"type": "calendar.update_event", "args": {"event_id": "CAL-BOARDPREP", "start": "2026-09-18T15:00:00-07:00", "end": "2026-09-18T16:00:00-07:00"}}]}
 {"id": "ACT-TR-05", "actions": [{"type": "app.open", "args": {"app": "Figma"}}]}
-{"id": "ACT-TR-06", "actions": [{"type": "slack.send_message", "args": {"to": "C10RP", "text": "Tell the route planner channel we're launching October 21"}}]}
+{"id": "ACT-TR-06", "actions": [{"type": "slack.send_message", "args": {"to": "C10RP", "text": "We're launching October 21 Launch moves to October 21 so Acme Freight can run a training week with their dispatchers before go-live."}}]}
 {"id": "ACT-TR-07", "actions": [{"type": "calendar.create_event", "args": {"title": "NRR fix", "start": "2026-09-17T14:00:00-07:00", "end": "2026-09-17T14:30:00-07:00", "attendees": ["ben@brightline.example.com"]}}]}
 {"id": "ACT-TR-08", "actions": [{"type": "memory.ask", "args": {"question": "What's our launch date again?"}}]}
-{"id": "ACT-TR-09", "actions": [{"type": "clarify", "args": {"question": "Did you mean Sarah Kim (internal on Slack) or Sarah Patel (Acme Freight on email)?"}}]}
-{"id": "ACT-TR-10", "actions": [{"type": "gmail.send", "args": {"to": ["john@brightline.example.com"], "subject": "Corrected NRR", "body": "Hi John, following up with the corrected NRR (112%)."}}, {"type": "slack.send_message", "args": {"to": "U06BEN", "text": "Thanks Ben for the great work!"}}]}
-{"id": "ACT-TR-11", "actions": [{"type": "confirm", "args": {"summary": "Are you sure you want to delete all my emails from marcus? This action is destructive and cannot be undone."}}]}
-{"id": "ACT-TR-12", "actions": [{"type": "reminder.create", "args": {"text": "Print the board deck", "due": "2026-09-23T08:00:00-07:00"}}]}
+{"id": "ACT-TR-09", "actions": [{"type": "clarify", "args": {"question": "Which Sarah do you mean: Sarah Kim or Sarah Patel?"}}]}
+{"id": "ACT-TR-10", "actions": [{"type": "gmail.send", "args": {"to": ["john@brightline.example.com"], "cc": [], "subject": "The corrected NRR", "body": "Hi John,\n\nFollowing up on the corrected NRR. Heads up: NRR is 112%, not 118% \u2014 the churn dashboard double-counted one expansion. Fixed now.\n\nAlex"}}, {"type": "slack.send_message", "args": {"to": "U06BEN", "text": "Thanks, Ben!"}}]}
+{"id": "ACT-TR-11", "actions": [{"type": "confirm", "args": {"summary": "This is destructive: \"Delete all my emails from Marcus\". Should I go ahead? (yes/no)"}}]}
+{"id": "ACT-TR-12", "actions": [{"type": "reminder.create", "args": {"text": "Print the deck", "due": "2026-09-23T08:00:00-07:00"}}]}

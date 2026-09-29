@@ -1,0 +1,9 @@
+{"id": "ACT-HO-01", "actions": [{"type": "gmail.send", "args": {"to": ["tom@foundryridge.example.com"], "cc": [], "subject": "The board pre-read will be ready", "body": "Hi Tom,\n\nThe board pre-read will be ready Monday\n\nAlex"}}]}
+{"id": "ACT-HO-02", "actions": [{"type": "slack.send_message", "args": {"to": "U07PRIYA", "text": "The latest regression numbers?"}}]}
+{"id": "ACT-HO-03", "actions": [{"type": "reminder.create", "args": {"text": "Send the pre-read to Tom", "due": "2026-09-21T09:00:00-07:00"}}]}
+{"id": "ACT-HO-04", "actions": [{"type": "calendar.update_event", "args": {"event_id": "CAL-F-18", "start": "2026-09-21T11:00:00-07:00", "end": "2026-09-21T12:00:00-07:00"}}]}
+{"id": "ACT-HO-05", "actions": [{"type": "calendar.create_event", "args": {"title": "Go over the Harbor forecast", "start": "2026-09-22T15:00:00-07:00", "end": "2026-09-22T16:00:00-07:00", "attendees": ["john@brightline.example.com", "marcus@brightline.example.com"]}}]}
+{"id": "ACT-HO-06", "actions": [{"type": "slack.send_message", "args": {"to": "C11SALES", "text": "Copperline is parked until late October"}}]}
+{"id": "ACT-HO-07", "actions": [{"type": "memory.ask", "args": {"question": "What did Chris Hale ask about SSO?"}}]}
+{"id": "ACT-HO-08", "actions": [{"type": "confirm", "args": {"summary": "This is destructive: \"Remove Dana from the offsite invite\". Should I go ahead? (yes/no)"}}]}
+{"id": "ACT-HO-09", "actions": [{"type": "app.open", "args": {"app": "Linear"}}]}

@@ -1,4 +1,11 @@
-"""Command-line interface and entry point for Candor Memory and Action system."""
+"""Command-line entry point.
+
+  python3 run.py                      # = eval: train + dev + holdout + paraphrase sets, all scorers
+  python3 run.py memory  -q QUESTIONS.jsonl -o memory_answers.jsonl
+  python3 run.py actions -c COMMANDS.jsonl  -o action_predictions.jsonl
+  python3 run.py ask "When is Route Planner v2 launching?" --as-of 2026-09-18T18:00:00-07:00
+  python3 run.py do  "Remind me an hour before the board meeting to print the deck" --as-of 2026-09-18T09:00:00-07:00
+"""
 from __future__ import annotations
 
 import argparse
@@ -11,142 +18,112 @@ from pathlib import Path
 from typing import Optional
 
 from candor.actions import ActionPlanner
-from candor.answering import AnswerEngine
-from candor.ingestion import DataIngestion
-from candor.models import ActionCommand, MemoryQuery
-from candor.retrieval import HybridRetriever
-from candor.temporal import TemporalEngine
+from candor.models import ActionCommand
+from candor.system import MemorySystem
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
-def run_memory_pipeline(
-    questions_path: str | Path,
-    output_path: str | Path,
-    data_dir: str | Path = "data",
-    model_provider: Optional[str] = None,
-    model_name: Optional[str] = None,
-) -> None:
-    """Run memory question answering pipeline."""
-    q_path = Path(questions_path)
-    out_path = Path(output_path)
-    d_dir = Path(data_dir)
+def _dt(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
-    print(f"Loading data from {d_dir}...")
-    ingestion = DataIngestion(d_dir)
-    temporal = TemporalEngine(ingestion.units, ingestion.deleted, ingestion.edits)
-    answerer = AnswerEngine(model_provider=model_provider, model_name=model_name)
 
-    print(f"Processing questions from {q_path}...")
-    answers = []
-    with open(q_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
+def _read_jsonl(path: str | Path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _write_jsonl(path: str | Path, rows) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
+def run_memory_pipeline(questions_path, output_path, data_dir="data", model_provider: Optional[str] = None,
+                        model_name: Optional[str] = None, system: Optional[MemorySystem] = None) -> None:
+    system = system or MemorySystem(data_dir, model_provider, model_name)
+    rows = [system.ask(x["id"], x["question"], _dt(x["as_of"])).to_dict() for x in _read_jsonl(questions_path)]
+    _write_jsonl(output_path, rows)
+    print(f"Wrote {len(rows)} answers to {output_path}", flush=True)
+
+
+def run_actions_pipeline(commands_path, output_path, data_dir="data", system: Optional[MemorySystem] = None) -> None:
+    system = system or MemorySystem(data_dir)
+    planner = ActionPlanner(data_dir, memory=system.snippet)
+    rows = [planner.plan_command(ActionCommand(x["id"], x["command"], x["as_of"])).to_dict()
+            for x in _read_jsonl(commands_path)]
+    _write_jsonl(output_path, rows)
+    print(f"Wrote {len(rows)} action predictions to {output_path}", flush=True)
+
+
+def _score(kind: str, gold: str, pred: str, data_dir: str, out: str) -> None:
+    harness = ROOT / "eval_harness"
+    env = {**os.environ, "PYTHONPATH": str(harness)}
+    if kind == "actions":
+        cmd = [sys.executable, str(harness / "score_actions.py"), "--gold", gold, "--predictions", pred, "--out", out]
+    else:
+        cmd = [sys.executable, str(harness / f"score_{kind}.py"), "--gold", gold, "--answers", pred, "--data", data_dir, "--out", out]
+        if kind == "memory":
+            cmd += ["--judge", "none"]
+    subprocess.run(cmd, env=env, check=False)
+
+
+def run_eval(data_dir: str = "data") -> None:
+    system = MemorySystem(data_dir)
+    jobs = [("train", "evals/memory_train.jsonl", "evals/actions_train.jsonl", "memory_answers.jsonl", "action_predictions.jsonl"),
+            ("dev", "evals/memory_dev.jsonl", "evals/actions_dev.jsonl", "memory_answers_dev.jsonl", "action_predictions_dev.jsonl"),
+            ("holdout", "evals/memory_holdout.jsonl", "evals/actions_holdout.jsonl", "memory_answers_holdout.jsonl", "action_predictions_holdout.jsonl"),
+            ("paraphrase", "evals/memory_paraphrase.jsonl", None, "memory_answers_paraphrase.jsonl", None)]
+    for name, mq, ac, mo, ao in jobs:
+        run_memory_pipeline(mq, mo, data_dir, system=system)
+        if ac:
+            run_actions_pipeline(ac, ao, data_dir, system=system)
+    for name, mq, ac, mo, ao in jobs:
+        for kind, gold, pred in (("retrieval", mq, mo), ("memory", mq, mo), ("actions", ac, ao)):
+            if not gold:
                 continue
-            item = json.loads(line)
-            as_of_dt = datetime.fromisoformat(item["as_of"].replace("Z", "+00:00"))
-            visible_units = temporal.get_visible_units(as_of_dt)
-            retriever = HybridRetriever(visible_units)
-
-            retrieved_ids = retriever.retrieve(item["question"], as_of_dt, top_k=20)
-            vis_map = {u.id: u for u in visible_units}
-            retrieved_units = [vis_map[uid] for uid in retrieved_ids if uid in vis_map]
-
-            query = MemoryQuery(
-                id=item["id"],
-                question=item["question"],
-                as_of=item["as_of"],
-                category=item.get("category"),
-                storyline=item.get("storyline"),
-            )
-            ans = answerer.answer_query(query, retrieved_units, as_of_dt)
-            answers.append(ans.to_dict())
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        for a in answers:
-            f.write(json.dumps(a) + "\n")
-
-    print(f"Wrote {len(answers)} answers to {out_path}")
-
-
-def run_actions_pipeline(
-    commands_path: str | Path,
-    output_path: str | Path,
-) -> None:
-    """Run action dry-run prediction pipeline."""
-    c_path = Path(commands_path)
-    out_path = Path(output_path)
-
-    planner = ActionPlanner()
-    predictions = []
-
-    print(f"Processing action commands from {c_path}...")
-    with open(c_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            cmd = ActionCommand(id=item["id"], command=item["command"], as_of=item["as_of"])
-            pred = planner.plan_command(cmd)
-            predictions.append(pred.to_dict())
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        for p in predictions:
-            f.write(json.dumps(p) + "\n")
-
-    print(f"Wrote {len(predictions)} action predictions to {out_path}")
+            print(f"\n{'=' * 64}\n{name.upper()} · {kind}\n{'=' * 64}", flush=True)
+            _score(kind, gold, pred, data_dir, f"results_{kind}{'' if name == 'train' else '_' + name}.json")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Candor Temporal Workplace Memory & Action System")
-    subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to execute")
+    p = argparse.ArgumentParser(description="Candor workplace memory + action planner")
+    sub = p.add_subparsers(dest="cmd")
+    m = sub.add_parser("memory", help="answer a JSONL file of memory questions")
+    m.add_argument("--questions", "-q", default="evals/memory_train.jsonl")
+    m.add_argument("--output", "-o", default="memory_answers.jsonl")
+    m.add_argument("--data", "-d", default="data")
+    m.add_argument("--provider", default=None, help="deterministic (default) or openai (any OpenAI-compatible endpoint)")
+    m.add_argument("--model", default=None)
+    a = sub.add_parser("actions", help="plan a JSONL file of commands (dry run)")
+    a.add_argument("--commands", "-c", default="evals/actions_train.jsonl")
+    a.add_argument("--output", "-o", default="action_predictions.jsonl")
+    a.add_argument("--data", "-d", default="data")
+    e = sub.add_parser("eval", help="run and score train + dev + holdout + paraphrase sets")
+    e.add_argument("--data", "-d", default="data")
+    q = sub.add_parser("ask", help="ask one question")
+    q.add_argument("question")
+    q.add_argument("--as-of", default="2026-09-18T18:00:00-07:00")
+    q.add_argument("--data", "-d", default="data")
+    d = sub.add_parser("do", help="plan one command (dry run)")
+    d.add_argument("command")
+    d.add_argument("--as-of", default="2026-09-18T18:00:00-07:00")
+    d.add_argument("--data", "-d", default="data")
+    args = p.parse_args()
 
-    # Memory parser
-    mem_p = subparsers.add_parser("memory", help="Run memory question answering")
-    mem_p.add_argument("--questions", "-q", default="evals/memory_train.jsonl", help="Path to input questions JSONL")
-    mem_p.add_argument("--output", "-o", default="memory_answers.jsonl", help="Path to output answers JSONL")
-    mem_p.add_argument("--data", "-d", default="data", help="Path to data directory")
-    mem_p.add_argument("--provider", default=None, help="LLM provider (deterministic, openai, anthropic, gemini)")
-    mem_p.add_argument("--model", default=None, help="LLM model name")
-
-    # Actions parser
-    act_p = subparsers.add_parser("actions", help="Run action command dry-run planner")
-    act_p.add_argument("--commands", "-c", default="evals/actions_train.jsonl", help="Path to input commands JSONL")
-    act_p.add_argument("--output", "-o", default="action_predictions.jsonl", help="Path to output predictions JSONL")
-
-    # Full eval parser
-    eval_p = subparsers.add_parser("eval", help="Run complete evaluation on train sets")
-    eval_p.add_argument("--data", "-d", default="data", help="Path to data directory")
-
-    args = parser.parse_args()
-
-    if args.subcommand == "memory":
-        run_memory_pipeline(args.questions, args.output, data_dir=args.data, model_provider=args.provider, model_name=args.model)
-    elif args.subcommand == "actions":
-        run_actions_pipeline(args.commands, args.output)
-    elif args.subcommand == "eval":
-        run_memory_pipeline("evals/memory_train.jsonl", "memory_answers.jsonl", data_dir=args.data)
-        run_actions_pipeline("evals/actions_train.jsonl", "action_predictions.jsonl")
-
-        env = dict(os.environ)
-        env["PYTHONPATH"] = f"eval_harness:{env.get('PYTHONPATH', '')}"
-
-        print("\n" + "=" * 60)
-        print("SCORING RETRIEVAL:")
-        print("=" * 60)
-        subprocess.run(["python3", "eval_harness/score_retrieval.py", "--gold", "evals/memory_train.jsonl", "--answers", "memory_answers.jsonl", "--data", str(args.data)], env=env)
-
-        print("\n" + "=" * 60)
-        print("SCORING MEMORY ANSWERS:")
-        print("=" * 60)
-        subprocess.run(["python3", "eval_harness/score_memory.py", "--gold", "evals/memory_train.jsonl", "--answers", "memory_answers.jsonl", "--data", str(args.data), "--judge", "none"], env=env)
-
-        print("\n" + "=" * 60)
-        print("SCORING ACTIONS:")
-        print("=" * 60)
-        subprocess.run(["python3", "eval_harness/score_actions.py", "--gold", "evals/actions_train.jsonl", "--predictions", "action_predictions.jsonl"], env=env)
+    if args.cmd == "memory":
+        run_memory_pipeline(args.questions, args.output, args.data, args.provider, args.model)
+    elif args.cmd == "actions":
+        run_actions_pipeline(args.commands, args.output, args.data)
+    elif args.cmd == "ask":
+        ans = MemorySystem(args.data).ask("Q", args.question, _dt(args.as_of))
+        print(json.dumps(ans.to_dict(), indent=2))
+    elif args.cmd == "do":
+        system = MemorySystem(args.data)
+        pred = ActionPlanner(args.data, memory=system.snippet).plan_command(ActionCommand("CMD", args.command, args.as_of))
+        print(json.dumps(pred.actions, indent=2))
     else:
-        # Default without subcommand: run both pipelines
-        run_memory_pipeline("evals/memory_train.jsonl", "memory_answers.jsonl", data_dir="data")
-        run_actions_pipeline("evals/actions_train.jsonl", "action_predictions.jsonl")
+        run_eval(getattr(args, "data", "data"))
 
 
 if __name__ == "__main__":

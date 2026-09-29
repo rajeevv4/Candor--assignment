@@ -1,381 +1,421 @@
-"""Hybrid retrieval engine with multi-field Okapi BM25, stemmed n-gram matching,
-contextual passage window expansion, topical continuity propagation, canonical date matching,
-source-type alignment, and Reciprocal Rank Fusion (RRF).
+"""Passage-level lexical retrieval with ranking signals. No embeddings, no question-specific rules.
 
-100% generalized across all 7 modalities with zero hardcoded question rules.
+Pipeline for one question at one `as_of`:
+
+1. Index only what is visible at `as_of` (delivered, not deleted, edits applied). Index statistics
+   (IDF, lengths) come from that visible set too, so future records can't even shift the ranking.
+2. Every unit becomes one or more passages:
+     - own text (+ speaker / channel / subject / title header); long units (Codex sessions, long
+       emails, long ChatGPT answers) are split into overlapping chunks, the unit scores as its best chunk
+     - a context passage: neighbouring meeting segments, the Slack thread / recent channel messages,
+       the previous ChatGPT turn, the email thread
+     - superseded text (pre-edit versions), searchable at low weight
+3. BM25 over each field, combined: own + 0.35*context + 0.3*history.
+4. Pseudo-relevance feedback (RM3-style): terms that are frequent in the top passages but
+   not in the question are added at low weight, which covers vocabulary mismatch without synonyms.
+5. Rank signals on normalised scores: dates the question mentions (explicit or relative), source
+   cues ("email", "Slack", "calendar", ...), people named in the question (as speaker/author), and a
+   mild recency prior, since the latest statement of a changing fact is usually the one that counts.
+6. Linked records (edit ↔ original, thread replies, dictation ↔ the message it produced, calendar
+   event ↔ its invitation emails) inherit part of each other's score, so old and new versions come together.
+7. Diversity: at most a few segments of the same meeting/conversation in the top 10.
 """
 from __future__ import annotations
 
 import math
 import re
 from collections import Counter, defaultdict
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import date, datetime
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from candor.models import MemoryUnit
+from candor.timeparse import explicit_dates, occurrences, parse_datetime_safe, relative_dates, to_local
+
+STOPWORDS = set("""
+a about above after again against all am an and any are as at be because been before being below between both
+but by can could did do does doing down during each few for from further had has have having he her here hers
+herself him himself his how i if in into is it its itself just me more most my myself no nor not of off on once
+only or other our ours ourselves out over own same she should so some such than that the their theirs them
+themselves then there these they this those through to too under until up very was we were what when where
+which while who whom why will with would you your yours yourself yourselves s t d ll m re ve y let lets get got
+also still yet again ever really actually like okay ok um uh yeah gonna go going kind sort thing things
+""".split())
+
+# words that shape the question but say nothing about its topic
+QUESTION_FILLER = set("""
+tell know said say says saying told ask asked mention mentioned think thought happen happened happening
+anything something someone somebody everything anyone
+""".split())
+
+# A small, general English/workplace thesaurus. Each group is a set of words used interchangeably;
+# a query word pulls in the rest of its group at reduced weight. Nothing here names a person,
+# customer, product or event from the data.
+SYNONYM_GROUPS: List[Set[str]] = [
+    {"slip", "delay", "postpone", "push", "move", "reschedule", "shift", "change"},
+    {"launch", "release", "ship", "go-live", "golive"},
+    {"fly", "flight", "flying", "depart", "departure"},
+    {"sign", "close", "signed", "closed", "contract"},
+    {"owner", "own", "owns", "responsible", "assigned", "plate"},
+    {"cancel", "cancelled", "canceled", "scratch", "drop", "off"},
+    {"hire", "hiring", "req", "role", "opening", "post"},
+    {"price", "pricing", "cost", "rate"},
+    {"bug", "issue", "regression", "defect", "problem"},
+    {"finish", "done", "complete", "delivered", "posted", "landed", "up"},
+    {"database", "db", "postgres", "sqlite", "store"},
+    {"meeting", "call", "sync", "session"},
+    {"prefer", "preference", "like", "rather"},
+    {"why", "because", "reason", "cause"},
+    {"deadline", "due", "by"},
+    {"mockup", "mockups", "design", "designs", "wireframe", "wireframes"},
+]
 
 
-MONTH_MAP = {
-    "jan": "01", "january": "01",
-    "feb": "02", "february": "02",
-    "mar": "03", "march": "03",
-    "apr": "04", "april": "04",
-    "may": "05",
-    "jun": "06", "june": "06",
-    "jul": "07", "july": "07",
-    "aug": "08", "august": "08",
-    "sep": "09", "september": "09",
-    "oct": "10", "october": "10",
-    "nov": "11", "november": "11",
-    "dec": "12", "december": "12",
-}
+def mine_acronyms(texts: Iterable[str]) -> Dict[str, Set[str]]:
+    """Acronyms defined in the data itself: 'SSO ... like single sign-on' -> {'sso': {'single','sign','on'}}.
 
-
-def tokenize(text: str) -> List[str]:
-    """Tokenize text into lowercase alphanumeric tokens."""
-    return re.findall(r"\b[a-zA-Z0-9_\-\.#]+\b", text.lower())
-
-
-def simple_stem(word: str) -> str:
-    """Lightweight suffix stemmer for general English terms."""
-    w = word.lower()
-    if len(w) <= 3:
-        return w
-    for suffix in ("ing", "tion", "tions", "ies", "es", "ed", "ly", "ment", "ments", "s"):
-        if w.endswith(suffix) and len(w) - len(suffix) >= 3:
-            if suffix == "ies":
-                return w[:-3] + "y"
-            return w[:-len(suffix)]
-    return w
-
-
-def get_ngrams(tokens: List[str], n: int = 2) -> List[str]:
-    """Generate n-grams from a token list."""
-    return ["_".join(tokens[i:i + n]) for i in range(len(tokens) - n + 1)]
-
-
-def extract_canonical_dates(text: str) -> Set[str]:
-    """Extract canonical 'YYYY-MM-DD' or 'MM-DD' dates from text in any standard format."""
-    found: Set[str] = set()
-    t_lower = text.lower()
-
-    # ISO dates: 2026-09-23
-    for m in re.finditer(r"\b(202\d)-(\d{2})-(\d{2})\b", t_lower):
-        found.add(f"{m.group(1)}-{m.group(2)}-{m.group(3)}")
-        found.add(f"{m.group(2)}-{m.group(3)}")
-
-    # Month name dates: Sep 23, September 23, Sep 23rd
-    for m in re.finditer(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b", t_lower):
-        m_prefix = m.group(1)[:3]
-        if m_prefix in MONTH_MAP:
-            m_num = MONTH_MAP[m_prefix]
-            d_num = f"{int(m.group(2)):02d}"
-            found.add(f"2026-{m_num}-{d_num}")
-            found.add(f"{m_num}-{d_num}")
-
-    # Slash dates: 9/23, 09/23
-    for m in re.finditer(r"\b(\d{1,2})/(\d{1,2})\b", t_lower):
-        mo = int(m.group(1))
-        day = int(m.group(2))
-        if 1 <= mo <= 12 and 1 <= day <= 31:
-            m_num = f"{mo:02d}"
-            d_num = f"{day:02d}"
-            found.add(f"2026-{m_num}-{d_num}")
-            found.add(f"{m_num}-{d_num}")
-
+    An all-caps token counts as defined when, within 4 words of it in the same record, a run of
+    words whose initials spell it appears right next to it (first word not a stopword, at most one stopword).
+    The mapping is used both ways for query expansion.
+    """
+    found: Dict[str, Set[str]] = defaultdict(set)
+    for text in texts:
+        words = re.findall(r"[A-Za-z]+", text)
+        low = [w.lower() for w in words]
+        for pos, w in enumerate(words):
+            if not re.fullmatch(r"[A-Z]{2,5}", w) or w.lower() in STOPWORDS:
+                continue
+            ac, n = w.lower(), len(w)
+            best = None
+            for i in range(max(0, pos - n - 4), min(len(low) - n + 1, pos + 5)):
+                run = low[i:i + n]
+                if i <= pos < i + n or ac in run or "".join(x[0] for x in run) != ac:
+                    continue
+                if run[0] in STOPWORDS or sum(x in STOPWORDS for x in run) > 1 or any(len(x) < 2 for x in run):
+                    continue
+                if best is None or abs(i - pos) < abs(best[0] - pos):
+                    best = (i, run)
+            if best:
+                found[ac] |= set(best[1])
     return found
 
 
+SOURCE_CUES: Dict[str, Tuple[str, ...]] = {
+    "email": ("email", "emailed", "emails", "mail", "inbox", "gmail", "wrote to", "reply", "replied"),
+    "slack": ("slack", "channel", "dm", "posted", "thread"),
+    "calendar": ("calendar", "invite", "scheduled", "schedule", "booked", "meeting time", "what's on", "whats on"),
+    "dictation": ("dictate", "dictated", "dictation", "note to self", "voice note", "notes to self"),
+    "meeting": ("meeting", "call", "standup", "1:1", "one-on-one", "review", "debrief", "go/no-go", "said in"),
+    "codex": ("codex", "prototype", "repo", "code", "coding", "migration", "script"),
+    "chatgpt": ("chatgpt", "gpt", "asked the ai", "draft"),
+}
+
+
+def stem(w: str) -> str:
+    """Light suffix stripping, enough to match launch/launching/launched, cases/case, etc."""
+    if len(w) <= 3 or not w.isalpha():
+        return w
+    for suf, rep in (("ies", "y"), ("ied", "y"), ("ing", ""), ("ed", ""), ("es", ""), ("ly", ""), ("s", "")):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            base = w[: -len(suf)] + rep
+            if suf in ("ing", "ed") and len(base) > 3 and base[-1] == base[-2] and base[-1] not in "lsz":
+                base = base[:-1]  # planned -> plan, stopping -> stop
+            if suf == "es" and not re.search(r"(sh|ch|x|ss|z)$", base):
+                base = w[:-1]     # dates -> date
+            return base[:-1] if base.endswith("e") and len(base) > 3 else base
+    return w[:-1] if w.endswith("e") and len(w) > 3 else w
+
+
+def tokenize(text: str) -> List[str]:
+    t = text.lower().replace("’", "'")
+    t = re.sub(r"'s\b", "", t)
+    t = re.sub(r"\b(\d{2})(?:st|nd|rd|th)[ -]percentile\b", r"p\1", t)   # "95th percentile" == "p95"
+    t = re.sub(r"\bmedian\b", "median p50", t)
+    return re.findall(r"[a-z0-9]+(?:\.[0-9]+)?", t)
+
+
+def terms(text: str) -> List[str]:
+    return [stem(w) for w in tokenize(text) if w not in STOPWORDS]
+
+
 class BM25:
-    """Okapi BM25 implementation for multi-field document indexing."""
+    """Okapi BM25 over an inverted index, with weighted query terms."""
 
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
-        self.k1 = k1
-        self.b = b
-        self.doc_len: List[int] = []
-        self.avg_doc_len: float = 0.0
-        self.doc_count: int = 0
-        self.doc_freqs: Dict[str, int] = defaultdict(int)
-        self.idf: Dict[str, float] = {}
-        self.doc_tfs: List[Dict[str, int]] = []
+    def __init__(self, docs: List[List[str]], k1: float = 1.2, b: float = 0.75, min_len: int = 0):
+        self.k1, self.b = k1, b
+        self.n = len(docs)
+        # a length floor keeps two-word ASR fragments ("And release notes.") from out-scoring real statements
+        self.lens = [max(len(d), min_len) for d in docs]
+        self.avg = (sum(self.lens) / self.n) if self.n else 1.0
+        self.post: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        for i, d in enumerate(docs):
+            for term, tf in Counter(d).items():
+                self.post[term].append((i, tf))
+        self.idf = {t: math.log(1 + (self.n - len(p) + 0.5) / (len(p) + 0.5)) for t, p in self.post.items()}
 
-    def fit(self, corpus: List[List[str]]) -> None:
-        self.doc_count = len(corpus)
-        if self.doc_count == 0:
-            return
-        total_len = 0
-        for doc in corpus:
-            dlen = len(doc)
-            self.doc_len.append(dlen)
-            total_len += dlen
-            tf: Dict[str, int] = Counter(doc)
-            self.doc_tfs.append(tf)
-            for term in tf:
-                self.doc_freqs[term] += 1
-
-        self.avg_doc_len = total_len / self.doc_count if self.doc_count > 0 else 1.0
-
-        for term, freq in self.doc_freqs.items():
-            self.idf[term] = math.log(1.0 + (self.doc_count - freq + 0.5) / (freq + 0.5))
-
-    def score(self, query_tokens: List[str]) -> List[float]:
-        scores = [0.0] * self.doc_count
-        for token in query_tokens:
-            if token not in self.idf:
+    def score(self, q: Dict[str, float]) -> Dict[int, float]:
+        out: Dict[int, float] = defaultdict(float)
+        for term, w in q.items():
+            idf = self.idf.get(term)
+            if not idf:
                 continue
-            idf_val = self.idf[token]
-            for doc_idx in range(self.doc_count):
-                tf = self.doc_tfs[doc_idx].get(token, 0)
-                if tf == 0:
-                    continue
-                dlen = self.doc_len[doc_idx]
-                numerator = tf * (self.k1 + 1.0)
-                denominator = tf + self.k1 * (1.0 - self.b + self.b * (dlen / self.avg_doc_len))
-                scores[doc_idx] += idf_val * (numerator / denominator)
-        return scores
+            for i, tf in self.post[term]:
+                denom = tf + self.k1 * (1 - self.b + self.b * self.lens[i] / (self.avg or 1))
+                out[i] += w * idf * tf * (self.k1 + 1) / denom
+        return out
+
+
+def _chunks(tokens: List[str], size: int = 120, step: int = 80) -> List[List[str]]:
+    if len(tokens) <= size + 40:
+        return [tokens]
+    return [tokens[i:i + size] for i in range(0, max(1, len(tokens) - 40), step)]
 
 
 class HybridRetriever:
-    """Generalized hybrid multi-field retriever with contextual windows and temporal scoring."""
+    """Ranks the units visible at one `as_of` for a question."""
 
-    GENERAL_SYNONYMS: Dict[str, List[str]] = {
-        "launch": ["launching", "go-live", "release", "ship", "target", "date", "slipping", "moved", "pushed", "slips", "lock", "schedule"],
-        "launching": ["launch", "go-live", "release", "ship", "target", "date", "slip", "moved", "lock"],
-        "slip": ["slipped", "slipping", "delay", "delayed", "regression", "geocoding", "move", "moved", "pushed", "postponed"],
-        "slipped": ["slip", "delay", "delayed", "regression", "geocoding", "move", "moved", "pushed"],
-        "delay": ["slip", "slipped", "pushed", "moved", "regression", "geocoding", "postpone"],
-        "pricing": ["proposal", "tier", "tiers", "contract", "quote", "rate", "$18", "$15", "vehicle", "per vehicle", "agreement"],
-        "proposal": ["pricing", "quote", "sent", "extension", "acme", "sarah patel", "promised", "tiers", "rate", "out"],
-        "promised": ["promise", "call", "acme", "friday", "proposal", "send you", "revised", "committed"],
-        "demo": ["harbor", "demo environment", "staging", "ben", "marcus", "october", "scratch", "walkthrough"],
-        "mockups": ["onboarding", "figma", "dana", "designs", "wireframes", "flow", "mockup"],
-        "onboarding": ["mockups", "figma", "dana", "dispatchers", "assigned", "designs"],
-        "dark": ["dark mode", "theme", "v2.1", "fast-follow", "dana", "john", "keep", "cut", "feature"],
-        "mode": ["dark mode", "theme", "dark", "fast-follow", "v2.1", "feature"],
-        "cut": ["cutting", "drop", "keep", "omit", "remove", "fast-follow"],
-        "designer": ["second designer", "design hire", "recruiting", "series a", "extension", "leah", "wait", "role"],
-        "hiring": ["recruiting", "second designer", "series a", "leah", "role", "posted", "candidate", "interview"],
-        "harbor": ["harbor logistics", "marcus", "liability", "q4", "sign", "$120k", "deal", "uncapped", "dunn"],
-        "latency": ["p95", "routing", "median", "800ms", "1.8", "benchmark", "performance", "corrected", "ms", "seconds"],
-        "p95": ["latency", "routing", "1.8", "800ms", "median", "seconds", "corrected", "benchmark"],
-        "board": ["board deck", "boardprep", "prep", "cal-boardprep", "foundry ridge", "board meeting", "cal-board", "pre-read"],
-        "eta": ["eta prototype", "eta predictor", "postgis", "postgres", "nearest depot", "sqlite", "geospatial"],
-        "database": ["postgres", "postgis", "sqlite", "geospatial", "eta", "prototype", "depot"],
-        "standups": ["standup", "fridays", "async", "deep work", "note to self", "morning"],
-        "standup": ["standups", "fridays", "async", "deep work", "morning"],
-        "salary": ["compensation", "pay", "bonus", "equity", "rate", "remuneration"],
-        "sso": ["single sign-on", "q1", "deprioritized", "auth", "login", "saml"],
-        "flight": ["denver", "ua 1543", "united", "sfo", "depart", "6:10pm", "sep 23", "airport", "plane", "travel"],
-        "denver": ["flight", "ua 1543", "united", "sfo", "sep 23", "board meeting", "cal-board", "offsite", "colorado"],
-        "fly": ["flight", "denver", "ua 1543", "united", "sfo", "sep 23", "plane", "travel"],
-        "calendar": ["schedule", "meeting", "events", "cal", "day", "agenda", "board", "standup", "1:1"],
-        "dictate": ["dictation", "sarah patel", "pricing proposal", "volume tiers", "extension", "note", "sent", "email", "gmail"],
-        "dictated": ["dictation", "sarah patel", "pricing proposal", "volume tiers", "extension", "sent", "email", "gmail"],
-        "regression": ["geocoding", "test plan", "notion", "64", "61/64", "60/64", "priya", "flaky", "passing", "cases"],
-        "signed": ["contract", "acme", "cfo", "review", "reviewing", "under review", "proposal", "agreement", "close"],
-        "passing": ["regression", "61/64", "60/64", "priya", "flaky", "tests", "cases", "passed"],
-        "owner": ["assigned", "owns", "owning", "lead", "workstream", "responsible"],
-        "owns": ["owner", "assigned", "owning", "lead", "due", "landed"],
-        "out": ["sent", "delivered", "email", "gmail", "message", "reply", "sent email"],
-        "send": ["sent", "email", "gmail", "proposal", "delivered"],
-        "sent": ["send", "email", "gmail", "proposal", "out", "delivered"],
-    }
+    # field weights and ranking-signal weights (tuned on train + my own dev set, see README)
+    W = {"own": 1.0, "ctx": 0.35, "title": 0.4, "hist": 0.3, "syn": 0.25, "prf": 0.0,
+         "date": 0.4, "source": 0.12, "person": 0.12, "recency": 0.2, "link": 0.8,
+         "min_len": 8, "per_record": 4}
 
-    KNOWN_ENTITIES: Dict[str, List[str]] = {
-        "acme": ["acme", "acme freight", "sarah patel", "chris hale"],
-        "harbor": ["harbor", "harbor logistics", "mike dunn"],
-        "sarah kim": ["sarah kim", "sarahk", "u03sarahk", "sarah.kim"],
-        "sarah patel": ["sarah patel", "sarah.patel", "acme"],
-        "dana": ["dana", "dana lee", "u04dana"],
-        "priya": ["priya", "priya nair", "u07priya"],
-        "marcus": ["marcus", "marcus webb", "u05marcus"],
-        "ben": ["ben", "ben carter", "u06ben"],
-        "john": ["john", "john okafor", "u02john"],
-        "leah": ["leah", "leah brooks", "u08leah"],
-        "rachel": ["rachel", "rachel gomez", "u09rachel"],
-        "tom": ["tom", "foundry ridge"],
-        "figma": ["figma"],
-        "notion": ["notion"],
-        "postgres": ["postgres", "postgis"],
-        "postgis": ["postgis", "postgres"],
-        "denver": ["denver", "united", "ua 1543", "flight"],
-    }
-
-    def __init__(self, visible_units: List[MemoryUnit]):
+    def __init__(self, visible_units: List[MemoryUnit], people: Optional[Iterable[str]] = None,
+                 weights: Optional[Dict[str, float]] = None):
+        self.W = {**HybridRetriever.W, **(weights or {})}
         self.units = visible_units
-        self.unit_count = len(visible_units)
-        self.unit_map = {u.id: u for u in visible_units}
-        self.bm25_text = BM25(k1=1.5, b=0.75)
-        self.bm25_stemmed = BM25(k1=1.2, b=0.75)
-        self.bm25_entities = BM25(k1=1.2, b=0.5)
-        self.bm25_window = BM25(k1=1.2, b=0.8)
-        self.rec_units: Dict[str, List[int]] = defaultdict(list)
-        self.unit_canonical_dates: List[Set[str]] = []
-        self._build_indices()
+        self.by_id = {u.id: i for i, u in enumerate(visible_units)}
+        self.people = {p.lower() for p in (people or [])} | {
+            (u.author_name or "").lower() for u in visible_units
+            if u.author_name and u.source_type in ("slack", "meeting") and " " in u.author_name}
+        self.acronyms = mine_acronyms(u.raw_text for u in visible_units)
+        self._build()
 
-    def _build_indices(self) -> None:
-        """Build multi-aspect BM25 indices with contextual passage windows."""
-        text_corpus: List[List[str]] = []
-        stemmed_corpus: List[List[str]] = []
-        entity_corpus: List[List[str]] = []
-        window_corpus: List[List[str]] = []
+    # ------------------------------------------------------------------ indexing
+    def _header(self, u: MemoryUnit) -> str:
+        return u.title_or_context
 
-        for idx, u in enumerate(self.units):
-            self.rec_units[u.record_id].append(idx)
-            unit_dates = extract_canonical_dates(u.text)
-            unit_dates.add(u.timestamp.strftime("%Y-%m-%d"))
-            unit_dates.add(u.timestamp.strftime("%m-%d"))
-            self.unit_canonical_dates.append(unit_dates)
+    def _build(self) -> None:
+        units = self.units
+        by_record: Dict[str, List[int]] = defaultdict(list)
+        by_channel: Dict[str, List[int]] = defaultdict(list)
+        for i, u in enumerate(units):
+            by_record[u.record_id].append(i)
+            if u.source_type == "slack":
+                by_channel[u.metadata.get("channel_id", "")].append(i)
+        self.by_record = by_record
 
-        for idx, u in enumerate(self.units):
-            raw_toks = tokenize(u.text)
-            title_toks = tokenize(u.title_or_context) * 2
-            author_toks = tokenize(u.author_name or "") * 2
+        own_docs: List[List[str]] = []
+        self.own_owner: List[int] = []
+        ctx_docs: List[List[str]] = []
+        hist_docs: List[List[str]] = []
+        title_docs: List[List[str]] = []
+        self.hist_owner: List[int] = []
 
-            doc_toks = raw_toks + title_toks + author_toks
-            text_corpus.append(doc_toks)
+        neighbours: Dict[int, List[int]] = defaultdict(list)
+        for idxs in by_record.values():
+            if len(idxs) > 1:
+                for p, i in enumerate(idxs):
+                    neighbours[i] = idxs[max(0, p - 2):p] + idxs[p + 1:p + 3]
+        for idxs in by_channel.values():
+            for p, i in enumerate(idxs):
+                near = [j for j in idxs[max(0, p - 2):p] + idxs[p + 1:p + 2]
+                        if abs((units[j].timestamp - units[i].timestamp).total_seconds()) < 3600]
+                neighbours[i] = near
 
-            stemmed_toks = [simple_stem(t) for t in doc_toks]
-            bigrams = get_ngrams(raw_toks, 2)
-            stemmed_corpus.append(stemmed_toks + bigrams)
+        for i, u in enumerate(units):
+            body = u.raw_text or u.text
+            if u.source_type == "codex":
+                pieces = u.metadata.get("turns") or [body]
+                groups = [" ".join(pieces[k:k + 3]) for k in range(0, len(pieces), 2)] or [body]
+            else:
+                toks = tokenize(body)
+                groups = [" ".join(c) for c in _chunks(toks)]
+            for g in groups:
+                own_docs.append(terms(g))
+                self.own_owner.append(i)
+            title_docs.append(terms(f"{u.author_name or ''} {self._header(u)}"))
 
-            ent_list = []
-            if u.author_name:
-                ent_list.append(u.author_name.lower())
-            for r in u.recipients:
-                ent_list.append(str(r).lower())
-            if u.source_type:
-                ent_list.append(u.source_type)
-            ent_toks = tokenize(" ".join(ent_list))
-            entity_corpus.append(ent_toks)
+            ctx_parts = [units[j].raw_text for j in neighbours.get(i, [])]
+            for lid in u.links:
+                j = self.by_id.get(lid)
+                if j is not None:
+                    ctx_parts.append(units[j].raw_text[:600])
+            if u.source_type == "calendar":
+                ctx_parts.append(u.text)
+            ctx_docs.append(terms(" ".join(ctx_parts)))
 
-            unit_indices = self.rec_units[u.record_id]
-            pos = unit_indices.index(idx)
-            start_pos = max(0, pos - 3)
-            end_pos = min(len(unit_indices), pos + 4)
-            window_text_parts = [self.units[unit_indices[p]].text for p in range(start_pos, end_pos)]
-            window_toks = tokenize(" ".join(window_text_parts)) + title_toks
-            window_corpus.append(window_toks)
+            for old in u.history:
+                hist_docs.append(terms(old))
+                self.hist_owner.append(i)
 
-        self.bm25_text.fit(text_corpus)
-        self.bm25_stemmed.fit(stemmed_corpus)
-        self.bm25_entities.fit(entity_corpus)
-        self.bm25_window.fit(window_corpus)
+        ml = int(self.W["min_len"])
+        self.own = BM25(own_docs, k1=1.2, b=0.75, min_len=ml)
+        self.ctx = BM25(ctx_docs, k1=1.2, b=0.75, min_len=ml)
+        self.title = BM25(title_docs, k1=1.2, b=0.3)
+        self.hist = BM25(hist_docs or [[]], k1=1.2, b=0.75, min_len=ml)
 
-    def retrieve(self, query: str, as_of: datetime, top_k: int = 20) -> List[str]:
-        """Rank and retrieve top_k unit IDs using Reciprocal Rank Fusion (RRF)."""
+        # dates each unit is "about": when it happened, dates it mentions, calendar occurrences
+        self.unit_dates: List[Set[date]] = []
+        for u in units:
+            ref = to_local(u.timestamp)
+            ds: Set[date] = set()
+            if u.source_type == "calendar":
+                st = u.metadata.get("start", {})
+                start = parse_datetime_safe(st.get("dateTime") or st.get("date"))
+                en = u.metadata.get("end", {})
+                end = parse_datetime_safe(en.get("dateTime") or en.get("date"))
+                if start and u.metadata.get("recurrence"):
+                    ds |= set(occurrences(start, u.metadata["recurrence"], (date(ref.year, 1, 1), date(ref.year, 12, 31))))
+                elif start:
+                    d, last = start.date(), (end.date() if end else start.date())
+                    if st.get("date") and last > d:
+                        last = date.fromordinal(last.toordinal() - 1)  # all-day end date is exclusive
+                    while d <= last:
+                        ds.add(d)
+                        d = date.fromordinal(d.toordinal() + 1)
+            else:
+                ds.add(ref.date())
+                ds |= explicit_dates(u.raw_text, ref)
+                if u.source_type == "meeting":
+                    ds.add(to_local(parse_datetime_safe(u.metadata.get("meeting_start")) or u.timestamp).date())
+            self.unit_dates.append(ds)
+
+        self.t0 = min((u.timestamp for u in units), default=None)
+
+    # ------------------------------------------------------------------ query side
+    def query_terms(self, question: str) -> Dict[str, float]:
+        q: Dict[str, float] = {}
+        words = [w for w in tokenize(question) if w not in STOPWORDS and w not in QUESTION_FILLER]
+        for w in words:
+            q[stem(w)] = 1.0
+        ql = " ".join(words)
+        for ac, expansion in self.acronyms.items():
+            exp_terms = {stem(w) for w in expansion if w not in STOPWORDS}
+            if ac in words:
+                for t in exp_terms:
+                    q.setdefault(t, self.W["syn"])
+            elif exp_terms and exp_terms <= {stem(w) for w in words}:
+                q.setdefault(ac, 1.0)
+        for w in words:
+            for group in SYNONYM_GROUPS:
+                if w in group or stem(w) in {stem(g) for g in group}:
+                    for g in group:
+                        for t in terms(g):
+                            q.setdefault(t, self.W["syn"])
+        return q
+
+    def _lexical(self, q: Dict[str, float]) -> Dict[int, float]:
+        scores: Dict[int, float] = defaultdict(float)
+        best_own: Dict[int, float] = {}
+        for p, s in self.own.score(q).items():
+            i = self.own_owner[p]
+            best_own[i] = max(best_own.get(i, 0.0), s)
+        for i, s in best_own.items():
+            scores[i] += self.W["own"] * s
+        for i, s in self.ctx.score(q).items():
+            scores[i] += self.W["ctx"] * s
+        for i, s in self.title.score(q).items():
+            scores[i] += self.W["title"] * s
+        if self.hist_owner:
+            for p, s in self.hist.score(q).items():
+                scores[self.hist_owner[p]] += self.W["hist"] * s
+        return scores
+
+    def _feedback_terms(self, ranked: List[int], q: Dict[str, float], k: int = 5, n_terms: int = 8) -> Dict[str, float]:
+        tf: Counter = Counter()
+        for i in ranked[:k]:
+            tf.update(set(terms(self.units[i].raw_text)))
+        cand = []
+        for t, c in tf.items():
+            if t in q or len(t) < 3 or t.isdigit() or c < 2:
+                continue
+            idf = self.own.idf.get(t, 0.0)
+            cand.append((c * idf, t))
+        cand.sort(reverse=True)
+        return {t: self.W["prf"] for _, t in cand[:n_terms]}
+
+    def _query_dates(self, question: str, as_of: datetime) -> Set[date]:
+        q = re.sub(r"\b(?:from|instead of|was)\s+(?:\w+\s+)?\d{1,2}(?:st|nd|rd|th)?\b", " ", question.lower())
+        return explicit_dates(q, to_local(as_of)) | relative_dates(q, to_local(as_of))
+
+    def _people_in(self, question: str) -> Set[str]:
+        ql = question.lower()
+        found = {p for p in self.people if p and re.search(rf"\b{re.escape(p)}\b", ql)}
+        return found
+
+    def rank(self, question: str, as_of: datetime) -> List[Tuple[str, float]]:
         if not self.units:
             return []
+        q = self.query_terms(question)
+        lex = self._lexical(q)
+        if not lex:
+            return []
+        first = sorted(lex, key=lex.get, reverse=True)
+        fb = self._feedback_terms(first, q) if self.W["prf"] > 0 else {}
+        if fb:
+            lex2 = self._lexical({**fb, **q})
+            lex = {i: lex.get(i, 0.0) * 0.75 + lex2.get(i, 0.0) * 0.25 for i in set(lex) | set(lex2)}
+        top = max(lex.values()) or 1.0
+        score = {i: s / top for i, s in lex.items()}
 
-        q_lower = query.lower()
-        base_tokens = tokenize(query)
-        stemmed_tokens = [simple_stem(t) for t in base_tokens]
-        query_bigrams = get_ngrams(base_tokens, 2)
+        ql = question.lower()
+        qdates = self._query_dates(question, as_of)
+        cues = {src for src, words in SOURCE_CUES.items() if any(re.search(rf"(?<!\w){re.escape(w)}(?!\w)", ql) for w in words)}
+        if "calendar" in cues and not qdates:
+            # two-hop dates: "the day I fly to Denver" -> dates mentioned by the best non-calendar hits
+            for i in sorted(score, key=score.get, reverse=True)[:3]:
+                if self.units[i].source_type != "calendar":
+                    qdates |= explicit_dates(self.units[i].raw_text, to_local(self.units[i].timestamp))
+        if qdates:
+            for i, ds in enumerate(self.unit_dates):
+                if i not in score and ds & qdates and (self.units[i].source_type == "calendar" or "calendar" not in cues):
+                    score[i] = 0.0
+        people = self._people_in(question)
+        span = (as_of - self.t0).total_seconds() if self.t0 else 0
 
-        expanded_tokens = list(base_tokens)
-        for t in base_tokens:
-            if t in self.GENERAL_SYNONYMS:
-                expanded_tokens.extend(self.GENERAL_SYNONYMS[t])
+        for i in list(score):
+            u = self.units[i]
+            s = score[i]
+            if qdates and self.unit_dates[i] & qdates:
+                s += self.W["date"]
+            if u.source_type in cues:
+                s += self.W["source"]
+            if people and (u.author_name or "").lower() in people:
+                s += self.W["person"]
+            if span > 0 and u.source_type != "calendar":
+                s += self.W["recency"] * max(0.0, (u.timestamp - self.t0).total_seconds() / span)
+            score[i] = s
 
-        entity_tokens = list(base_tokens)
-        for ent_name, aliases in self.KNOWN_ENTITIES.items():
-            if any(alias in q_lower for alias in aliases):
-                entity_tokens.extend(tokenize(ent_name))
-                for a in aliases:
-                    entity_tokens.extend(tokenize(a))
+        # linked records share evidence (edit <-> original, thread, dictation <-> sent message, invite <-> event)
+        final = dict(score)
+        for i, s in score.items():
+            for lid in self.units[i].links:
+                j = self.by_id.get(lid)
+                if j is not None:
+                    final[j] = max(final.get(j, 0.0), self.W["link"] * s)
+        return sorted(((self.units[i].id, s) for i, s in final.items()), key=lambda x: -x[1])
 
-        # 1. BM25 scoring channels
-        scores_text = self.bm25_text.score(expanded_tokens)
-        scores_stemmed = self.bm25_stemmed.score(stemmed_tokens + query_bigrams)
-        scores_entities = self.bm25_entities.score(entity_tokens)
-        scores_window = self.bm25_window.score(expanded_tokens)
+    def retrieve(self, question: str, as_of: datetime, top_k: int = 20, per_record_top10: Optional[int] = None) -> List[str]:
+        ranked = self.rank(question, as_of)
+        per_record_top10 = int(per_record_top10 or self.W["per_record"])
+        out: List[str] = []
+        overflow: List[str] = []
+        per_rec: Counter = Counter()
+        for uid, _ in ranked:
+            rec = self.units[self.by_id[uid]].record_id
+            if len(out) < 10 and per_rec[rec] >= per_record_top10:
+                overflow.append(uid)
+                continue
+            out.append(uid)
+            per_rec[rec] += 1
+            if len(out) >= 10:
+                break
+        rest = [uid for uid, _ in ranked if uid not in set(out)]
+        for uid in rest:
+            if len(out) >= top_k:
+                break
+            out.append(uid)
+        return out[:top_k]
 
-        # 2. Topical continuity propagation: propagate high segment scores to adjacent segments
-        propagated_scores = list(scores_text)
-        for rec_id, indices in self.rec_units.items():
-            for p, doc_idx in enumerate(indices):
-                if scores_text[doc_idx] > 0:
-                    for offset in (-2, -1, 1, 2):
-                        neighbor_pos = p + offset
-                        if 0 <= neighbor_pos < len(indices):
-                            neighbor_idx = indices[neighbor_pos]
-                            decay = 0.6 ** abs(offset)
-                            propagated_scores[neighbor_idx] = max(propagated_scores[neighbor_idx], scores_text[doc_idx] * decay)
-
-        # 3. Date-based temporal relevance
-        is_from_date = bool(re.search(r"\bfrom\s+(?:sep|oct|jan|feb|mar|apr|may|jun|jul|aug|nov|dec)", q_lower))
-        query_dates: Set[str] = set()
-        if not is_from_date:
-            query_dates = extract_canonical_dates(query)
-            if "denver" in q_lower or "flight" in q_lower:
-                query_dates.add("2026-09-23")
-                query_dates.add("09-23")
-
-        date_scores = [0.0] * self.unit_count
-        if query_dates:
-            for i in range(self.unit_count):
-                if bool(query_dates & self.unit_canonical_dates[i]):
-                    date_scores[i] = 10.0
-
-        # 4. Source-type alignment
-        source_type_scores = [0.0] * self.unit_count
-        if "calendar" in q_lower or "schedule" in q_lower:
-            for i, u in enumerate(self.units):
-                if u.source_type == "calendar":
-                    source_type_scores[i] = 5.0
-        elif "dictate" in q_lower or "dictation" in q_lower:
-            for i, u in enumerate(self.units):
-                if u.source_type == "dictation":
-                    source_type_scores[i] = 5.0
-        elif "email" in q_lower or "gmail" in q_lower:
-            for i, u in enumerate(self.units):
-                if u.source_type == "email":
-                    source_type_scores[i] = 5.0
-
-        # 5. Reciprocal Rank Fusion (RRF)
-        def get_ranks(score_list: List[float]) -> Dict[int, int]:
-            ranked_indices = sorted(range(len(score_list)), key=lambda i: score_list[i], reverse=True)
-            return {doc_idx: rank + 1 for rank, doc_idx in enumerate(ranked_indices) if score_list[doc_idx] > 0}
-
-        ranks_text = get_ranks(scores_text)
-        ranks_prop = get_ranks(propagated_scores)
-        ranks_stemmed = get_ranks(scores_stemmed)
-        ranks_entities = get_ranks(scores_entities)
-        ranks_window = get_ranks(scores_window)
-        ranks_date = get_ranks(date_scores)
-        ranks_source = get_ranks(source_type_scores)
-
-        rrf_scores: Dict[int, float] = defaultdict(float)
-        k_const = 60.0
-
-        for doc_idx, rank in ranks_text.items():
-            rrf_scores[doc_idx] += 1.5 / (k_const + rank)
-        for doc_idx, rank in ranks_prop.items():
-            rrf_scores[doc_idx] += 1.3 / (k_const + rank)
-        for doc_idx, rank in ranks_window.items():
-            rrf_scores[doc_idx] += 1.2 / (k_const + rank)
-        for doc_idx, rank in ranks_stemmed.items():
-            rrf_scores[doc_idx] += 1.0 / (k_const + rank)
-        for doc_idx, rank in ranks_entities.items():
-            rrf_scores[doc_idx] += 0.9 / (k_const + rank)
-        for doc_idx, rank in ranks_date.items():
-            rrf_scores[doc_idx] += 1.2 / (k_const + rank)
-        for doc_idx, rank in ranks_source.items():
-            rrf_scores[doc_idx] += 1.0 / (k_const + rank)
-
-        # Recency adjustment for temporal update queries
-        is_update_query = any(w in q_lower for w in ["launch", "date", "status", "current", "when", "now", "today", "passing"])
-        if is_update_query:
-            for doc_idx, u in enumerate(self.units):
-                if doc_idx in rrf_scores and rrf_scores[doc_idx] > 0:
-                    time_ratio = (u.timestamp.timestamp() / as_of.timestamp()) if as_of.timestamp() > 0 else 1.0
-                    rrf_scores[doc_idx] *= (0.90 + 0.10 * time_ratio)
-
-        # Sort candidate doc indices
-        ranked_docs = sorted(rrf_scores.keys(), key=lambda idx: rrf_scores[idx], reverse=True)
-
-        if not ranked_docs:
-            ranked_docs = list(range(min(top_k, self.unit_count)))
-
-        result_ids = [self.units[idx].id for idx in ranked_docs[:top_k]]
-        return result_ids
+    def unit(self, uid: str) -> Optional[MemoryUnit]:
+        i = self.by_id.get(uid)
+        return self.units[i] if i is not None else None

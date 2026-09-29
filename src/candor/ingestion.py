@@ -1,21 +1,40 @@
-"""Data ingestion and normalization module for all Candor sources."""
+"""Load every source in data/ into citable MemoryUnits with delivery times, edits, deletions and links."""
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from candor.models import MemoryUnit
 
+WEEKDAYS = {"MO": "Monday", "TU": "Tuesday", "WE": "Wednesday", "TH": "Thursday",
+            "FR": "Friday", "SA": "Saturday", "SU": "Sunday"}
+
 
 def parse_datetime(s: Any) -> datetime:
-    """Parse ISO datetime string with timezone offset into datetime object."""
     return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
 
 
+def split_address(s: str) -> Tuple[str, str]:
+    """'Sarah Patel <sarah.patel@x.com>' -> ('Sarah Patel', 'sarah.patel@x.com')."""
+    m = re.match(r"\s*(.*?)\s*<([^>]+)>\s*$", s or "")
+    if m:
+        return m.group(1).strip('" '), m.group(2).strip().lower()
+    return "", (s or "").strip().lower()
+
+
+def human_time(dt: datetime) -> str:
+    return dt.strftime("%A %B %-d %Y %-I:%M %p").replace(":00 ", " ")
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"\W+", " ", text.lower()).strip()
+
+
 class DataIngestion:
-    """Ingests, parses, normalizes, and connects all mock data sources."""
+    """Parses all connectors and native captures into one list of units."""
 
     def __init__(self, data_dir: str | Path):
         self.data_dir = Path(data_dir)
@@ -25,10 +44,11 @@ class DataIngestion:
         self.channels: Dict[str, Dict[str, Any]] = {}
         self.deleted: Dict[str, datetime] = {}
         self.edits: Dict[str, List[Tuple[datetime, str]]] = {}
+        self.owner_name = "Me"
         self.load_all()
 
+    # ------------------------------------------------------------------ loading
     def load_all(self) -> None:
-        """Load all data connectors and native records."""
         self._load_slack_metadata()
         self._load_meetings()
         self._load_dictations()
@@ -38,312 +58,248 @@ class DataIngestion:
         self._load_codex_sessions()
         self._load_chatgpt_conversations()
 
-        # Connect edits and deletions to their target units
-        for target_id, del_time in self.deleted.items():
+        for target_id, t in self.deleted.items():
             if target_id in self.units_by_id:
-                self.units_by_id[target_id].deletion_time = del_time
-
+                self.units_by_id[target_id].deletion_time = t
         for target_id, edit_list in self.edits.items():
             if target_id in self.units_by_id:
-                self.units_by_id[target_id].edits.extend(edit_list)
+                self.units_by_id[target_id].edits.extend(sorted(edit_list))
 
-        # Sort all units chronologically by availability timestamp
+        self._link_dictations_to_outputs()
+        self._link_calendar_notifications()
         self.units.sort(key=lambda u: u.timestamp)
 
-    def _load_slack_metadata(self) -> None:
-        users_file = self.data_dir / "connectors/slack/users.json"
-        if users_file.exists():
-            for u in json.loads(users_file.read_text(encoding="utf-8")):
-                self.users[u["id"]] = u
-
-        channels_file = self.data_dir / "connectors/slack/channels.json"
-        if channels_file.exists():
-            for c in json.loads(channels_file.read_text(encoding="utf-8")):
-                self.channels[c["id"]] = c
-
-    def _add_unit(self, unit: MemoryUnit) -> None:
+    def _add(self, unit: MemoryUnit) -> None:
         self.units.append(unit)
         self.units_by_id[unit.id] = unit
 
+    def _link(self, a: str, b: str) -> None:
+        if a in self.units_by_id and b in self.units_by_id and a != b:
+            if b not in self.units_by_id[a].links:
+                self.units_by_id[a].links.append(b)
+            if a not in self.units_by_id[b].links:
+                self.units_by_id[b].links.append(a)
+
+    def _jsonl(self, rel: str) -> List[Dict[str, Any]]:
+        p = self.data_dir / rel
+        if not p.exists():
+            return []
+        return [json.loads(line) for line in p.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def _load_slack_metadata(self) -> None:
+        f = self.data_dir / "connectors/slack/users.json"
+        if f.exists():
+            self.users = {u["id"]: u for u in json.loads(f.read_text(encoding="utf-8"))}
+        f = self.data_dir / "connectors/slack/channels.json"
+        if f.exists():
+            self.channels = {c["id"]: c for c in json.loads(f.read_text(encoding="utf-8"))}
+        # the memory's owner (who dictates, codes, asks ChatGPT) is the one member of every DM
+        dms = [set(c.get("members", [])) for c in self.channels.values() if c.get("is_dm")]
+        if dms:
+            owner = set.intersection(*dms)
+            if len(owner) == 1:
+                self.owner_name = self.users.get(owner.pop(), {}).get("real_name") or self.owner_name
+
     def _load_meetings(self) -> None:
-        meetings_dir = self.data_dir / "native/meetings"
-        if not meetings_dir.exists():
+        d = self.data_dir / "native/meetings"
+        if not d.exists():
             return
-        for f in sorted(meetings_dir.glob("*.json")):
+        for f in sorted(d.glob("*.json")):
             m = json.loads(f.read_text(encoding="utf-8"))
             start = parse_datetime(m["start"])
-            m_id = m["id"]
             title = m.get("title", "")
-            participants = m.get("participants_known", [])
             for s in m["segments"]:
-                seg_id = s["seg_id"]
-                end_s = s["end_s"]
-                seg_time = start + timedelta(seconds=end_s)
                 speaker = s.get("speaker_name") or s.get("speaker_label") or "Unknown speaker"
-                raw_text = s["text"]
-                formatted_text = f"[{title}, {m['start'][:10]}] {speaker}: {raw_text}"
-                unit = MemoryUnit(
-                    id=seg_id,
-                    record_id=m_id,
+                self._add(MemoryUnit(
+                    id=s["seg_id"],
+                    record_id=m["id"],
                     source_type="meeting",
-                    timestamp=seg_time,
+                    timestamp=start + timedelta(seconds=s["end_s"]),
                     title_or_context=title,
                     author_name=speaker,
-                    recipients=participants,
-                    raw_text=raw_text,
-                    text=formatted_text,
+                    recipients=m.get("participants_known", []),
+                    raw_text=s["text"],
+                    text=f"[{title}, {m['start'][:10]}] {speaker}: {s['text']}",
                     metadata={
-                        "meeting_id": m_id,
-                        "channel": s.get("channel"),
-                        "start_s": s.get("start_s"),
-                        "end_s": end_s,
-                        "location": m.get("location"),
-                        "calendar_event_id": m.get("calendar_event_id"),
+                        "meeting_id": m["id"],
+                        "meeting_start": m["start"],
+                        "speaker_identified": bool(s.get("speaker_name")),
                         "speaker_confidence": s.get("speaker_confidence"),
-                    }
-                )
-                self._add_unit(unit)
+                        "calendar_event_id": m.get("calendar_event_id"),
+                        "location": m.get("location"),
+                    },
+                ))
 
     def _load_dictations(self) -> None:
-        dict_file = self.data_dir / "native/dictation/dictations.jsonl"
-        if not dict_file.exists():
-            return
-        for line in dict_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            x = json.loads(line)
-            d_id = x["id"]
-            d_time = parse_datetime(x["timestamp"])
-            raw = x.get("raw_transcript", "")
+        for x in self._jsonl("native/dictation/dictations.jsonl"):
             clean = x.get("cleaned_text", "")
-            mode = x.get("mode", "dictation")
-            app = x.get("target_app", "")
-            context = x.get("target_context", "")
-            state = x.get("delivery_state", "")
-
+            raw = x.get("raw_transcript", "")
             raw_part = f"\n(raw transcript: {raw})" if raw else ""
-            formatted_text = f"[Dictation {mode} into {app} – {context}, {state}] {clean}{raw_part}"
-
-            unit = MemoryUnit(
-                id=d_id,
-                record_id=d_id,
+            self._add(MemoryUnit(
+                id=x["id"],
+                record_id=x["id"],
                 source_type="dictation",
-                timestamp=d_time,
-                title_or_context=f"Dictation into {app} ({context})",
-                author_name="Alex Rivera",
-                author_id="alex@brightline.example.com",
+                timestamp=parse_datetime(x["timestamp"]),
+                title_or_context=f"Dictation into {x.get('target_app', '')} ({x.get('target_context', '')})",
+                author_name=self.owner_name,
                 raw_text=clean,
-                text=formatted_text,
-                metadata=x
-            )
-            self._add_unit(unit)
+                text=(f"[Dictation {x.get('mode')} into {x.get('target_app')} – {x.get('target_context')}, "
+                      f"{x.get('delivery_state')}] {clean}{raw_part}"),
+                metadata=x,
+            ))
+
+    def _slack_name(self, uid: str | None, bot: str | None = None) -> str:
+        return self.users.get(uid or "", {}).get("real_name") or bot or uid or "Unknown"
 
     def _load_slack_messages(self) -> None:
-        msg_file = self.data_dir / "connectors/slack/messages.jsonl"
-        if not msg_file.exists():
-            return
-        for line in msg_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            x = json.loads(line)
-            s_id = x["id"]
+        for x in self._jsonl("connectors/slack/messages.jsonl"):
             t = parse_datetime(x["ts"])
-            ch_id = x["channel_id"]
-            ch_info = self.channels.get(ch_id, {})
-            where = ch_info.get("name", ch_id)
-
-            subtype = x.get("subtype")
-            if subtype == "message_deleted":
-                target_id = x["target_id"]
-                self.deleted[target_id] = t
-                formatted_text = f"[Slack {where}] (message {target_id} was deleted)"
-                unit = MemoryUnit(
-                    id=s_id,
-                    record_id=s_id,
-                    source_type="slack",
-                    timestamp=t,
-                    title_or_context=f"Slack #{where}",
-                    author_name=self.users.get(x.get("user"), {}).get("real_name", x.get("user")),
-                    author_id=x.get("user"),
-                    raw_text=formatted_text,
-                    text=formatted_text,
-                    metadata=x
-                )
-                self._add_unit(unit)
+            ch = self.channels.get(x["channel_id"], {})
+            where = ch.get("name", x["channel_id"])
+            sub = x.get("subtype")
+            base = dict(record_id=x["id"], source_type="slack", timestamp=t,
+                        title_or_context=f"Slack #{where}", metadata=x)
+            if sub == "message_deleted":
+                self.deleted[x["target_id"]] = t
+                txt = f"[Slack {where}] (message {x['target_id']} was deleted)"
+                self._add(MemoryUnit(id=x["id"], raw_text="", text=txt, **base))
                 continue
-
-            if subtype == "message_changed":
-                target_id = x["target_id"]
-                new_text = x["text"]
-                self.edits.setdefault(target_id, []).append((t, new_text))
-                formatted_text = f"[Slack {where}, edit of {target_id}] {new_text}"
-                unit = MemoryUnit(
-                    id=s_id,
-                    record_id=s_id,
-                    source_type="slack",
-                    timestamp=t,
-                    title_or_context=f"Slack #{where}",
-                    author_name=self.users.get(x.get("user"), {}).get("real_name", x.get("user")),
-                    author_id=x.get("user"),
-                    raw_text=new_text,
-                    text=formatted_text,
-                    metadata=x
-                )
-                self._add_unit(unit)
+            if sub == "message_changed":
+                self.edits.setdefault(x["target_id"], []).append((t, x["text"]))
+                target = self.units_by_id.get(x["target_id"])
+                author = target.author_name if target else self._slack_name(x.get("user"))
+                self._add(MemoryUnit(id=x["id"], author_name=author, raw_text=x["text"],
+                                     text=f"[Slack {where}, edit of {x['target_id']}] {x['text']}",
+                                     links=[x["target_id"]], **base))
+                self._link(x["id"], x["target_id"])
                 continue
-
-            # Standard message
-            user_id = x.get("user")
-            user_info = self.users.get(user_id, {})
-            who = user_info.get("real_name") or x.get("bot_name") or user_id or "Unknown"
-            raw_text = x.get("text", "")
-            formatted_text = f"[Slack {where}] {who}: {raw_text}"
-
-            unit = MemoryUnit(
-                id=s_id,
-                record_id=s_id,
-                source_type="slack",
-                timestamp=t,
-                title_or_context=f"Slack #{where}",
-                author_name=who,
-                author_id=user_id,
-                recipients=ch_info.get("members", []),
-                raw_text=raw_text,
-                text=formatted_text,
-                metadata=x
-            )
-            self._add_unit(unit)
+            who = self._slack_name(x.get("user"), x.get("bot_name"))
+            self._add(MemoryUnit(id=x["id"], author_name=who, author_id=x.get("user"),
+                                 recipients=ch.get("members", []), raw_text=x.get("text", ""),
+                                 text=f"[Slack {where}] {who}: {x.get('text', '')}", **base))
+            if x.get("thread_parent_id"):
+                self._link(x["id"], x["thread_parent_id"])
 
     def _load_gmail_messages(self) -> None:
-        gmail_file = self.data_dir / "connectors/gmail/messages.jsonl"
-        if not gmail_file.exists():
-            return
-        for line in gmail_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            x = json.loads(line)
-            e_id = x["id"]
-            t = parse_datetime(x["date"])
-            sender = x.get("from", "")
-            to_list = x.get("to", [])
-            cc_list = x.get("cc", [])
-            subject = x.get("subject", "")
-            body = x.get("body", "")
-
-            cc_str = f" Cc {', '.join(cc_list)}" if cc_list else ""
-            formatted_text = f"[Email {x['date'][:16]}] From {sender} To {', '.join(to_list)}{cc_str} | {subject}\n{body}"
-
-            unit = MemoryUnit(
-                id=e_id,
-                record_id=e_id,
+        threads: Dict[str, List[str]] = {}
+        for x in self._jsonl("connectors/gmail/messages.jsonl"):
+            sender_name, sender_email = split_address(x.get("from", ""))
+            to, cc = x.get("to", []), x.get("cc", [])
+            cc_str = f" Cc {', '.join(cc)}" if cc else ""
+            self._add(MemoryUnit(
+                id=x["id"],
+                record_id=x["id"],
                 source_type="email",
-                timestamp=t,
-                title_or_context=f"Email: {subject}",
-                author_name=sender,
-                author_id=sender,
-                recipients=to_list + cc_list,
-                raw_text=body,
-                text=formatted_text,
-                metadata=x
-            )
-            self._add_unit(unit)
+                timestamp=parse_datetime(x["date"]),
+                title_or_context=f"Email: {x.get('subject', '')}",
+                author_name=sender_name or sender_email,
+                author_id=sender_email,
+                recipients=to + cc,
+                raw_text=x.get("body", ""),
+                text=f"[Email {x['date'][:16]}] From {x.get('from')} To {', '.join(to)}{cc_str} | {x.get('subject', '')}\n{x.get('body', '')}",
+                metadata=x,
+            ))
+            threads.setdefault(x.get("thread_id") or x["id"], []).append(x["id"])
+        for ids in threads.values():
+            for a in ids:
+                for b in ids:
+                    self._link(a, b)
 
     def _load_calendar_events(self) -> None:
-        cal_file = self.data_dir / "connectors/google_calendar/events.jsonl"
-        if not cal_file.exists():
-            return
-        for line in cal_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            x = json.loads(line)
-            c_id = x["id"]
-            t = parse_datetime(x["updated"])
-            summary = x.get("summary", "")
-            description = x.get("description", "")
-            location = x.get("location", "")
-            st = x.get("start", {})
-            en = x.get("end", {})
+        for x in self._jsonl("connectors/google_calendar/events.jsonl"):
+            st, en = x.get("start", {}), x.get("end", {})
             when = f"{st.get('dateTime') or st.get('date')} to {en.get('dateTime') or en.get('date')}"
+            if st.get("dateTime"):
+                readable = f"{human_time(parse_datetime(st['dateTime']))} – {parse_datetime(en['dateTime']).strftime('%-I:%M %p')}"
+            else:
+                readable = f"all day {datetime.fromisoformat(st['date']).strftime('%A %B %-d %Y')}"
+            rep = ""
+            for rule in x.get("recurrence") or []:
+                days = re.search(r"BYDAY=([A-Z,]+)", rule)
+                if days:
+                    rep = " | repeats every " + " ".join(WEEKDAYS.get(d, d) for d in days.group(1).split(","))
             attendees = [a.get("email") for a in x.get("attendees", []) if isinstance(a, dict)]
-            att_str = ", ".join(attendees)
-            rep_str = f" | repeats {x['recurrence']}" if x.get("recurrence") else ""
-
-            formatted_text = f"[Calendar, {x.get('status')}] {summary} | {when} | {location} | attendees: {att_str} | {description}{rep_str}"
-
-            unit = MemoryUnit(
-                id=c_id,
-                record_id=c_id,
+            self._add(MemoryUnit(
+                id=x["id"],
+                record_id=x["id"],
                 source_type="calendar",
-                timestamp=t,
-                title_or_context=f"Calendar: {summary}",
+                timestamp=parse_datetime(x["updated"]),
+                title_or_context=f"Calendar: {x.get('summary', '')}",
                 author_name=x.get("organizer", ""),
                 author_id=x.get("organizer", ""),
                 recipients=attendees,
-                raw_text=f"{summary}\n{description}",
-                text=formatted_text,
-                metadata=x
-            )
-            self._add_unit(unit)
+                raw_text=f"{x.get('summary', '')}\n{x.get('description') or ''}",
+                text=(f"[Calendar, {x.get('status')}] {x.get('summary')} | {when} | {readable}{rep} | "
+                      f"{x.get('location') or ''} | attendees: {', '.join(attendees)} | {x.get('description') or ''}"),
+                metadata=x,
+            ))
 
     def _load_codex_sessions(self) -> None:
-        codex_dir = self.data_dir / "connectors/codex/sessions"
-        if not codex_dir.exists():
+        d = self.data_dir / "connectors/codex/sessions"
+        if not d.exists():
             return
-        for f in sorted(codex_dir.glob("*.jsonl")):
-            lines = [json.loads(l) for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
-            if not lines:
+        for f in sorted(d.glob("*.jsonl")):
+            events = [json.loads(line) for line in f.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if not events:
                 continue
-            meta, body = lines[0], lines[1:]
-            s_id = meta["id"]
-            t = parse_datetime(body[-1]["timestamp"] if body else meta["started_at"])
-            text_lines = []
+            meta, body = events[0], events[1:]
+            turns = []
             for e in body:
-                role_or_tool = e.get("role") or e.get("tool") or e.get("type", "")
+                who = e.get("role") or e.get("tool") or e.get("type", "")
                 content = e.get("content") or e.get("input") or ""
-                out = e.get("output", "")
-                out_str = f"\nOutput: {out}" if out else ""
-                text_lines.append(f"{role_or_tool}: {content}{out_str}")
-
-            joined_text = "\n".join(text_lines)
-            repo = meta.get("repo", "")
-            formatted_text = f"[Codex session, repo {repo}]\n{joined_text}"
-
-            unit = MemoryUnit(
-                id=s_id,
-                record_id=s_id,
+                out = f"\nOutput: {e['output']}" if e.get("output") else ""
+                turns.append(f"{who}: {content}{out}")
+            joined = "\n".join(turns)
+            self._add(MemoryUnit(
+                id=meta["id"],
+                record_id=meta["id"],
                 source_type="codex",
-                timestamp=t,
-                title_or_context=f"Codex session: {repo}",
-                author_name="Alex Rivera",
-                raw_text=joined_text,
-                text=formatted_text,
-                metadata=meta
-            )
-            self._add_unit(unit)
+                timestamp=parse_datetime(body[-1]["timestamp"] if body else meta["started_at"]),
+                title_or_context=f"Codex session: {meta.get('repo', '')}",
+                author_name=self.owner_name,
+                raw_text=joined,
+                text=f"[Codex session, repo {meta.get('repo')}]\n{joined}",
+                metadata={**meta, "turns": turns},
+            ))
 
     def _load_chatgpt_conversations(self) -> None:
-        cgpt_file = self.data_dir / "connectors/chatgpt/conversations.json"
-        if not cgpt_file.exists():
+        f = self.data_dir / "connectors/chatgpt/conversations.json"
+        if not f.exists():
             return
-        for c in json.loads(cgpt_file.read_text(encoding="utf-8")):
-            c_id = c["id"]
+        for c in json.loads(f.read_text(encoding="utf-8")):
             title = c.get("title", "")
             for m in c.get("messages", []):
-                m_id = m["id"]
-                t = parse_datetime(m["create_time"])
                 role = m.get("role", "")
-                content = m.get("content", "")
-                formatted_text = f"[ChatGPT '{title}'] {role}: {content}"
-
-                unit = MemoryUnit(
-                    id=m_id,
-                    record_id=c_id,
+                self._add(MemoryUnit(
+                    id=m["id"],
+                    record_id=c["id"],
                     source_type="chatgpt",
-                    timestamp=t,
+                    timestamp=parse_datetime(m["create_time"]),
                     title_or_context=f"ChatGPT: {title}",
-                    author_name="Alex Rivera" if role == "user" else "ChatGPT",
-                    raw_text=content,
-                    text=formatted_text,
-                    metadata={"conversation_id": c_id, "title": title, "role": role}
-                )
-                self._add_unit(unit)
+                    author_name=self.owner_name if role == "user" else "ChatGPT",
+                    raw_text=m.get("content", ""),
+                    text=f"[ChatGPT '{title}'] {role}: {m.get('content', '')}",
+                    metadata={"conversation_id": c["id"], "title": title, "role": role},
+                ))
+
+    # ------------------------------------------------------------------ links
+    def _link_dictations_to_outputs(self) -> None:
+        """A dictation that was sent into Slack/Gmail is the same content as the message it produced."""
+        outputs = [u for u in self.units if u.source_type in ("slack", "email")]
+        for d in self.units:
+            if d.source_type != "dictation" or not d.raw_text:
+                continue
+            key = _norm(d.raw_text)[:60]
+            for o in outputs:
+                if abs((o.timestamp - d.timestamp).total_seconds()) <= 15 * 60 and key and key in _norm(o.raw_text):
+                    self._link(d.id, o.id)
+
+    def _link_calendar_notifications(self) -> None:
+        """Calendar invitation / update emails describe an event's earlier and current state."""
+        events = {_norm(u.metadata.get("summary", "")): u.id for u in self.units if u.source_type == "calendar"}
+        for u in self.units:
+            if u.source_type != "email":
+                continue
+            m = re.match(r"^(?:updated invitation|invitation|accepted|declined|canceled|cancelled)[^:]*:\s*(.+?)\s*@", u.metadata.get("subject", ""), re.I)
+            if m and _norm(m.group(1)) in events:
+                self._link(u.id, events[_norm(m.group(1))])

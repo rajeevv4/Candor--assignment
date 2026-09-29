@@ -1,0 +1,13 @@
+{"id": "ACT-DEV-01", "actions": [{"type": "slack.send_message", "args": {"to": "U04DANA", "text": "The onboarding mockups look great"}}]}
+{"id": "ACT-DEV-02", "actions": [{"type": "gmail.send", "args": {"to": ["dave.morales@pinecrestcarriers.example.com"], "cc": [], "subject": "The launch is now October 21", "body": "Hi Dave,\n\nThe launch is now October 21\n\nAlex"}}]}
+{"id": "ACT-DEV-03", "actions": [{"type": "reminder.create", "args": {"text": "Send the board pre-read", "due": "2026-09-21T08:00:00-07:00"}}]}
+{"id": "ACT-DEV-04", "actions": [{"type": "calendar.update_event", "args": {"event_id": "CAL-F-21", "start": "2026-09-22T14:00:00-07:00", "end": "2026-09-22T14:30:00-07:00"}}]}
+{"id": "ACT-DEV-05", "actions": [{"type": "app.open", "args": {"app": "Notion"}}]}
+{"id": "ACT-DEV-06", "actions": [{"type": "slack.send_message", "args": {"to": "C11SALES", "text": "The Acme proposal is out"}}]}
+{"id": "ACT-DEV-07", "actions": [{"type": "calendar.create_event", "args": {"title": "Review the regression results", "start": "2026-09-21T11:00:00-07:00", "end": "2026-09-21T12:00:00-07:00", "attendees": ["priya@brightline.example.com"]}}]}
+{"id": "ACT-DEV-08", "actions": [{"type": "memory.ask", "args": {"question": "Who owns the rollback plan?"}}]}
+{"id": "ACT-DEV-09", "actions": [{"type": "clarify", "args": {"question": "Which Sarah do you mean: Sarah Kim or Sarah Patel?"}}]}
+{"id": "ACT-DEV-10", "actions": [{"type": "confirm", "args": {"summary": "This is destructive: \"Cancel all my meetings next week\". Should I go ahead? (yes/no)"}}]}
+{"id": "ACT-DEV-11", "actions": [{"type": "reminder.create", "args": {"text": "Pull the latency numbers", "due": "2026-09-16T14:30:00-07:00"}}]}
+{"id": "ACT-DEV-12", "actions": [{"type": "slack.send_message", "args": {"to": "U06BEN", "text": "Thanks, Ben for fixing the churn dashboard!"}}]}
+{"id": "ACT-DEV-13", "actions": [{"type": "slack.send_message", "args": {"to": "C12DESIGN", "text": "Dark mode moves to v2.1"}}, {"type": "gmail.send", "args": {"to": ["leah@brightline.example.com"], "cc": [], "subject": "The designer role is still on", "body": "Hi Leah,\n\nThe designer role is still on hold\n\nAlex"}}]}

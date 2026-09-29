@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "candor-memory"
-version = "1.0.0"
-description = "Temporal Workplace Memory & Action System for Candor"
+version = "2.0.0"
+description = "Point-in-time workplace memory (passage-level retrieval) and a dry-run action planner"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     { name = "Rajeev Karakoti", email = "rajeevkarakoti04@gmail.com" }
 ]
